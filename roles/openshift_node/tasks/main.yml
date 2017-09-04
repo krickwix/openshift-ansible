@@ -1,0 +1,124 @@
+---
+- fail:
+    msg: "SELinux is disabled, This deployment type requires that SELinux is enabled."
+  when:
+    - (not ansible_selinux or ansible_selinux.status != 'enabled') and deployment_type in ['enterprise', 'online', 'atomic-enterprise', 'openshift-enterprise']
+    - not openshift_use_crio | default(false)
+
+- name: setup firewall
+  include: firewall.yml
+  static: yes
+
+#### Disable SWAP #####
+# https://docs.openshift.com/container-platform/3.4/admin_guide/overcommit.html#disabling-swap-memory
+- name: Check for swap usage
+  command: grep "^[^#].*swap" /etc/fstab
+  # grep: match any lines which don't begin with '#' and contain 'swap'
+  changed_when: false
+  failed_when: false
+  register: swap_result
+
+- when:
+    - swap_result.stdout_lines | length > 0
+    - openshift_disable_swap | default(true) | bool
+  block:
+    - name: Disable swap
+      command: swapoff --all
+
+    - name: Remove swap entries from /etc/fstab
+      replace:
+        dest: /etc/fstab
+        regexp: '(^[^#].*swap.*)'
+        replace: '# \1'
+        backup: yes
+
+    - name: Add notice about disabling swap
+      lineinfile:
+        dest: /etc/fstab
+        line: '# OpenShift-Ansible Installer disabled swap per overcommit guidelines'
+        state: present
+#### End Disable Swap Block ####
+
+- name: include node installer
+  include: install.yml
+
+- name: Restart cri-o
+  systemd:
+    name: cri-o
+    enabled: yes
+    state: restarted
+  when: openshift_use_crio | default(false)
+
+# The atomic-openshift-node service will set this parameter on
+# startup, but if the network service is restarted this setting is
+# lost. Reference: https://bugzilla.redhat.com/show_bug.cgi?id=1372388
+#
+# Use lineinfile w/ a handler for this task until
+# https://github.com/ansible/ansible/pull/24277 is included in an
+# ansible release and we can use the sysctl module.
+- name: Persist net.ipv4.ip_forward sysctl entry
+  lineinfile: dest=/etc/sysctl.conf regexp='^net.ipv4.ip_forward' line='net.ipv4.ip_forward=1'
+  notify:
+    - reload sysctl.conf
+
+- name: include bootstrap node config
+  include: bootstrap.yml
+  when: openshift_node_bootstrap
+
+- name: include standard node config
+  include: config.yml
+  when: not openshift_node_bootstrap
+
+- name: Check for credentials file for registry auth
+  stat:
+    path: "{{oreg_auth_credentials_path }}"
+  when:
+    - oreg_auth_user is defined
+  register: node_oreg_auth_credentials_stat
+
+- name: Create credentials for registry auth
+  command: "docker --config={{ oreg_auth_credentials_path }} login -u {{ oreg_auth_user }} -p {{ oreg_auth_password }} {{ oreg_host }}"
+  when:
+    - oreg_auth_user is defined
+    - (not node_oreg_auth_credentials_stat.stat.exists or oreg_auth_credentials_replace) | bool
+  notify:
+    - restart node
+
+- name: Configure AWS Cloud Provider Settings
+  lineinfile:
+    dest: /etc/sysconfig/{{ openshift.common.service_type }}-node
+    regexp: "{{ item.regex }}"
+    line: "{{ item.line }}"
+    create: true
+  with_items:
+    - regex: '^AWS_ACCESS_KEY_ID='
+      line: "AWS_ACCESS_KEY_ID={{ openshift_cloudprovider_aws_access_key | default('') }}"
+    - regex: '^AWS_SECRET_ACCESS_KEY='
+      line: "AWS_SECRET_ACCESS_KEY={{ openshift_cloudprovider_aws_secret_key | default('') }}"
+  no_log: True
+  when: openshift_cloudprovider_kind is defined and openshift_cloudprovider_kind == 'aws' and openshift_cloudprovider_aws_access_key is defined and openshift_cloudprovider_aws_secret_key is defined
+  notify:
+    - restart node
+
+#### Storage class plugins here ####
+- name: NFS storage plugin configuration
+  include: storage_plugins/nfs.yml
+  tags:
+    - nfs
+
+- name: GlusterFS storage plugin configuration
+  include: storage_plugins/glusterfs.yml
+  when: "'glusterfs' in openshift.node.storage_plugin_deps"
+
+- name: Ceph storage plugin configuration
+  include: storage_plugins/ceph.yml
+  when: "'ceph' in openshift.node.storage_plugin_deps"
+
+- name: iSCSI storage plugin configuration
+  include: storage_plugins/iscsi.yml
+  when: "'iscsi' in openshift.node.storage_plugin_deps"
+
+##### END Storage #####
+
+- include: config/workaround-bz1331590-ovs-oom-fix.yml
+  when: openshift.common.use_openshift_sdn | default(true) | bool
